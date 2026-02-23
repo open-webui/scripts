@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 # Author: Jan Kessler
 # License: AGPL-3.0
 
@@ -13,9 +14,33 @@ logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger()
 
 
+def sanitize_chats(main_conn, debug=False):
+    """
+    Sanitizes the chat table by replacing '\\u0020' with '\\u0000' in the chat column.
+
+    :param main_conn: Connection to the main database
+    :param debug: If True, executes SELECT instead of UPDATE and prints results
+    """
+    if not debug:
+        query = """
+            UPDATE chat
+            SET chat = REPLACE(chat::TEXT, '\\u0000', '\\u0020')::JSONB
+            WHERE chat::TEXT LIKE '%\\u0000%'
+        """
+    else:
+        query = """
+            SELECT id FROM chat
+            WHERE chat::TEXT LIKE '%\\u0000%'
+        """
+    with main_conn.cursor() as cur:
+        cur.execute(query)
+        if debug:
+            logger.debug(cur.fetchall())
+        logger.info(f"Sanitized {cur.rowcount} chats")
+
 def find_referenced_files(main_conn):
     """
-    Finds all referenced files in the chat and knowledge tables.
+    Finds all referenced files in the chat, knowledge, folder, chat_file and knowledge_file tables.
 
     :param main_conn: Connection to the main database
     :return: A set of referenced file IDs
@@ -26,8 +51,23 @@ def find_referenced_files(main_conn):
     query_chat_2 = """
         SELECT DISTINCT jsonb_path_query(chat::jsonb, '$.**.file.id') FROM chat
     """
+    query_chat_3 = """
+        SELECT DISTINCT jsonb_path_query(chat::jsonb, '$.files.id') FROM chat
+    """
+    query_chat_file = """
+        SELECT DISTINCT file_id FROM chat_file
+    """
     query_knowledge = """
         SELECT data FROM knowledge
+    """
+    query_knowledge_file = """
+        SELECT DISTINCT file_id FROM knowledge_file
+    """
+    query_folder_1 = """
+        SELECT DISTINCT jsonb_path_query(data::jsonb, '$.files[*] ? (@.type == "file").file.id') FROM folder
+    """
+    query_folder_2 = """
+        SELECT DISTINCT jsonb_path_query(data::jsonb, '$.files[*] ? (@.type == "file").id') FROM folder
     """
     with main_conn.cursor() as cur:
         # Extract from chats
@@ -35,12 +75,27 @@ def find_referenced_files(main_conn):
         files = set(row[0] for row in cur.fetchall())
         cur.execute(query_chat_2)
         files.update(set(row[0] for row in cur.fetchall()))
+        cur.execute(query_chat_3)
+        files.update(set(row[0] for row in cur.fetchall()))
+        # Extract from chat_file
+        cur.execute(query_chat_file)
+        files.update(set(row[0] for row in cur.fetchall()))
         logger.info(f"Found {len(files)} referenced files in chats.")
         # Extract from knowledge
         cur.execute(query_knowledge)
         for row in cur:
-            files.update(set(row[0].get('file_ids', [])))
+            if row[0]:
+                files.update(set(row[0].get('file_ids', [])))
+        # Extract from knowledge_file
+        cur.execute(query_knowledge_file)
+        files.update(set(row[0] for row in cur.fetchall()))
         logger.info(f"Found {len(files)} referenced files in chats and knowledge.")
+        # Extract from folders
+        cur.execute(query_folder_1)
+        files.update(set(row[0] for row in cur.fetchall()))
+        cur.execute(query_folder_2)
+        files.update(set(row[0] for row in cur.fetchall()))
+        logger.info(f"Found {len(files)} referenced files in chats, knowledge and folders.")
         logger.debug(f"Referenced files: {files}")
         return files
 
@@ -73,8 +128,11 @@ def find_referenced_collections(main_conn):
     :param vector_conn: Connection to the vector database
     :return: A set of referenced collection names
     """
-    query_chat = """
+    query_chat_1 = """
         SELECT DISTINCT jsonb_path_query(chat::jsonb, '$.**.collection_name') FROM chat
+    """
+    query_chat_2 = """
+        SELECT DISTINCT jsonb_path_query(chat::jsonb, '$.files[*] ? (@.type == "collection").id') FROM chat
     """
     query_files = """
         SELECT DISTINCT jsonb_path_query(meta::jsonb, '$.collection_name') FROM file
@@ -84,15 +142,17 @@ def find_referenced_collections(main_conn):
     """
 
     with main_conn.cursor() as cur:
-        cur.execute(query_chat)
+        cur.execute(query_chat_1)
         collections = set(row[0] for row in cur.fetchall())
+        cur.execute(query_chat_2)
+        collections.update(set(row[0] for row in cur.fetchall()))
         logger.info(f"Found {len(collections)} referenced collections in chats.")
         cur.execute(query_files)
         collections.update(set(row[0] for row in cur.fetchall()))
         logger.info(f"Found {len(collections)} referenced collections in chats and files.")
         cur.execute(query_memory)
         collections.update(set(f"user-memory-{row[0]}" for row in cur.fetchall()))
-        logger.info(f"Found {len(collections)} referenced collections in chats, files and knowledge.")
+        logger.info(f"Found {len(collections)} referenced collections in chats, files and memory.")
         logger.debug(f"Referenced Collections: {collections}")
         return collections
 
@@ -161,27 +221,42 @@ def find_unused_filenames_fs(referenced_filenames, uploads_dir):
 def cleanup_chats(main_conn, days, debug=False):
     """
     Cleans up old chats from the main database.
+    Also removes related entries from chat_file.
 
     :param main_conn: Connection to the main database
     :param days: Number of days to keep chats
     :param debug: If True, executes SELECT instead of DELETE and prints results
     """
     if not debug:
-        query = """
+        query_chats = """
             DELETE FROM chat
             WHERE NOT archived AND created_at < %s
+            RETURNING id
+        """
+        query_files = """
+            DELETE FROM chat_file
+            WHERE chat_id = ANY(%s)
         """
     else:
-        query = """
+        query_chats = """
             SELECT id FROM chat
             WHERE NOT archived AND created_at < %s
         """
+        query_files = """
+            SELECT id FROM chat_file
+            WHERE chat_id = ANY(%s)
+        """
     cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
     with main_conn.cursor() as cur:
-        cur.execute(query, (cutoff,))
+        cur.execute(query_chats, (cutoff,))
+        chat_ids = [row[0] for row in cur.fetchall()]
         if debug:
             logger.debug(cur.fetchall())
         logger.info(f"Deleted {cur.rowcount} chats")
+        cur.execute(query_files, [chat_ids])
+        if debug:
+            logger.debug(cur.fetchall())
+        logger.info(f"Deleted {cur.rowcount} chat_file entries.")
 
 def cleanup_files_db(main_conn, unused_files, debug=False):
     """
@@ -268,6 +343,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true', default=False)
     parser.add_argument('--verbose', action='store_true', default=False)
     parser.add_argument('--debug', action='store_true', default=False)
+    parser.add_argument('--sanitize', action='store_true', default=False)
     args = parser.parse_args()
 
     if args.verbose:
@@ -280,20 +356,24 @@ def main():
     vector_conn = psycopg.connect(args.vector_db_url)
 
     try:
-        # Step 1: Cleanup old chats
+        # Step 1: Sanitize chats
+        if args.sanitize:
+            sanitize_chats(main_conn, args.debug)
+
+        # Step 2: Cleanup old chats
         cleanup_chats(main_conn, args.keep_days, args.debug)
 
-        # Step 2: Delete unused files from DB
+        # Step 3: Delete unused files from DB
         referenced_files = find_referenced_files(main_conn)
         unused_files = find_unused_files_db(main_conn, referenced_files)
         cleanup_files_db(main_conn, unused_files, args.debug)
 
-        # Step 3: Delete unused collections from vector DB
+        # Step 4: Delete unused collections from vector DB
         referenced_collections = find_referenced_collections(main_conn)
         unused_collections = find_unused_collections(vector_conn, referenced_collections)
         cleanup_collections(vector_conn, unused_collections, args.debug)
 
-        # Step 4: Delete unused files from filesystem
+        # Step 5: Delete unused files from filesystem
         referenced_filenames = get_filenames_by_ids(main_conn, referenced_files)
         unused_filenames_fs = find_unused_filenames_fs(referenced_filenames, args.uploads_dir)
         cleanup_files_fs(unused_filenames_fs, args.uploads_dir, args.dry_run)
